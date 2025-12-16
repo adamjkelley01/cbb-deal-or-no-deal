@@ -1,5 +1,5 @@
 import random
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +10,7 @@ from nba_api.stats.static import teams as nba_teams
 from nba_api.stats.endpoints import (
     commonplayerinfo,
     commonteamroster,
-    leagueleaders,
+    leaguedashplayerstats,
 )
 
 app = FastAPI()
@@ -23,17 +23,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------
-# Season
-# -----------------------
 SEASON_2024_25 = "2024-25"
 
 # -----------------------
-# Health
+# Basic health
 # -----------------------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "season": SEASON_2024_25}
 
 
 # -----------------------
@@ -69,40 +66,32 @@ def search_players(q: str = Query(..., min_length=1), limit: int = 10):
     results = []
     for p in matches:
         pid = int(p["id"])
-        results.append(
-            {
-                "id": pid,
-                "name": p["full_name"],
-                "team": get_team_name(pid),
-            }
-        )
+        results.append({"id": pid, "name": p["full_name"], "team": get_team_name(pid)})
 
     return {"query": q, "count": len(results), "players": results}
 
 
 # -----------------------
-# Positions (from CommonTeamRoster)
+# Rosters and positions (source of truth for eligibility)
 # -----------------------
-# player_id -> raw roster position ("G", "F", "C", "G-F", "F-C", ...)
-POSITION_MAP: Dict[int, str] = {}
+# ROSTER_POSITION_MAP: player_id -> raw roster position ("G", "F", "C", "G-F", "F-C")
+ROSTER_POSITION_MAP: Dict[int, str] = {}
+# ROSTER_META: player_id -> {"name": ..., "team": ..., "raw_pos": ...}
+ROSTER_META: Dict[int, Dict[str, str]] = {}
 
 def normalize_position(pos: str) -> str:
     """
     Convert NBA roster position strings into one of: PG, SG, SF, PF, C.
 
-    Roster positions are coarse. This mapping is deterministic and explainable:
-    - G -> PG
-    - G-F -> SG
-    - F -> SF
-    - F-C -> PF
-    - C -> C
+    Note: Team rosters use coarse labels, not strict 1-5 positions.
+    This mapping is deterministic and easy to adjust if needed.
     """
     p = (pos or "").upper().strip()
 
     if p == "C":
         return "C"
     if p == "F-C":
-        return "PF"
+        return "C"   # treat F-C as center so C pool is large enough
     if p == "G-F":
         return "SG"
     if p == "F":
@@ -110,20 +99,27 @@ def normalize_position(pos: str) -> str:
     if p == "G":
         return "PG"
 
-    # Some rosters may have odd strings; default to wing
     return "SF"
 
 
-def build_position_map(season: str):
+def build_roster_maps(season: str) -> Dict[str, int]:
     """
-    Build a position map by calling CommonTeamRoster once per NBA team.
-    This avoids slow per-player calls and keeps /game endpoints fast.
-    """
-    global POSITION_MAP
-    POSITION_MAP = {}
+    Calls CommonTeamRoster once per NBA team.
+    Builds:
+      - ROSTER_POSITION_MAP
+      - ROSTER_META (name, team, raw_pos)
 
-    for t in nba_teams.get_teams():
+    This defines who is eligible to appear in the game.
+    """
+    global ROSTER_POSITION_MAP, ROSTER_META
+    ROSTER_POSITION_MAP = {}
+    ROSTER_META = {}
+
+    teams = nba_teams.get_teams()
+    for t in teams:
         team_id = t["id"]
+        team_name = t.get("full_name", t.get("abbreviation", "Unknown"))
+
         try:
             roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=season)
             df = roster.get_data_frames()[0]
@@ -133,35 +129,49 @@ def build_position_map(season: str):
         for _, row in df.iterrows():
             try:
                 pid = int(row.get("PLAYER_ID"))
-                pos = str(row.get("POSITION", "")).strip()
-                if pid and pos:
-                    POSITION_MAP[pid] = pos
+                name = str(row.get("PLAYER", "")).strip()
+                raw_pos = str(row.get("POSITION", "")).strip()
             except Exception:
-                pass
+                continue
 
+            if not pid or not name:
+                continue
 
-# Build positions once on import/startup
-build_position_map(SEASON_2024_25)
+            if raw_pos:
+                ROSTER_POSITION_MAP[pid] = raw_pos
+            else:
+                ROSTER_POSITION_MAP[pid] = ""
+
+            ROSTER_META[pid] = {
+                "name": name,
+                "team": str(team_name),
+                "raw_pos": raw_pos,
+            }
+
+    return {"players": len(ROSTER_META), "positions": len(ROSTER_POSITION_MAP), "teams": len(teams)}
 
 
 # -----------------------
-# League leaders (PerGame) used for tiering
+# Season stats (source of truth for tiering)
+# Exclude players with no stats by definition (not present in stats table or 0 GP / 0 MIN)
 # -----------------------
-LEADERS_CACHE = TTLCache(maxsize=2, ttl=60 * 60)  # 1 hour cache
+STATS_CACHE = TTLCache(maxsize=2, ttl=60 * 60)  # 1 hour cache
 
-def get_league_leaders_pergame_df():
-    if SEASON_2024_25 in LEADERS_CACHE:
-        return LEADERS_CACHE[SEASON_2024_25]
+def get_season_stats_df():
+    """
+    LeagueDashPlayerStats returns a league-wide table of player stats for the season.
+    We use PerGame for tier score (same idea as your original approach).
+    """
+    if SEASON_2024_25 in STATS_CACHE:
+        return STATS_CACHE[SEASON_2024_25]
 
-    ll = leagueleaders.LeagueLeaders(
+    dash = leaguedashplayerstats.LeagueDashPlayerStats(
         season=SEASON_2024_25,
-        per_mode48="PerGame",
-        scope="S",
         season_type_all_star="Regular Season",
-        stat_category_abbreviation="PTS",
+        per_mode_detailed="PerGame",
     )
-    df = ll.get_data_frames()[0]
-    LEADERS_CACHE[SEASON_2024_25] = df
+    df = dash.get_data_frames()[0]
+    STATS_CACHE[SEASON_2024_25] = df
     return df
 
 
@@ -175,13 +185,12 @@ def production_score_pergame(row) -> float:
     return pts + 1.2 * reb + 1.5 * ast + 3.0 * stl + 3.0 * blk - 2.0 * tov
 
 
-def build_case_pool_from_candidates(candidates, seed: int):
+def build_case_pool_from_candidates(candidates: List[dict], seed: int):
     candidates.sort(key=lambda x: x["score"], reverse=True)
 
     if len(candidates) < 16:
         raise HTTPException(status_code=400, detail=f"Not enough candidates. Found {len(candidates)}.")
 
-    # 16 tiers by rank
     tiers = [[] for _ in range(16)]
     n = len(candidates)
     for i, player in enumerate(candidates):
@@ -190,7 +199,6 @@ def build_case_pool_from_candidates(candidates, seed: int):
 
     rng = random.Random(seed)
 
-    # pick one from each tier
     chosen = []
     for tier_index, tier_players in enumerate(tiers, start=1):
         if not tier_players:
@@ -198,7 +206,6 @@ def build_case_pool_from_candidates(candidates, seed: int):
         pick = rng.choice(tier_players)
         chosen.append({"tier": tier_index, "player": pick})
 
-    # shuffle into case numbers
     rng.shuffle(chosen)
 
     cases = []
@@ -215,29 +222,109 @@ def build_case_pool_from_candidates(candidates, seed: int):
     return cases
 
 
+def build_candidates(slot: Optional[str] = None) -> List[dict]:
+    """
+    Candidate pool rules:
+      1) Must have season stats (LeagueDashPlayerStats row)
+      2) Must be on a 2024-25 team roster (CommonTeamRoster)
+      3) If slot provided, must match normalized roster position
+      4) Exclude players with no stats: enforce GP > 0 and MIN > 0
+    """
+    df = get_season_stats_df()
+
+    slot_norm: Optional[str] = None
+    if slot is not None:
+        s = slot.upper().strip()
+        if s not in {"PG", "SG", "SF", "PF", "C"}:
+            raise HTTPException(status_code=400, detail="slot must be one of PG, SG, SF, PF, C")
+        slot_norm = s
+
+    if len(ROSTER_META) == 0:
+        raise HTTPException(
+            status_code=503,
+            detail="Roster map is empty. Call POST /admin/refresh_rosters then retry.",
+        )
+
+    candidates: List[dict] = []
+
+    for _, row in df.iterrows():
+        try:
+            pid = int(row.get("PLAYER_ID"))
+        except Exception:
+            continue
+
+        # must be on roster
+        meta = ROSTER_META.get(pid)
+        if not meta:
+            continue
+
+        # must have actually played (exclude no-stats and zero-minute rows)
+        gp = float(row.get("GP", 0))
+        min_pg = float(row.get("MIN", 0))
+        if gp <= 0 or min_pg <= 0:
+            continue
+
+        # slot filter (based on roster position)
+        if slot_norm is not None:
+            raw_pos = ROSTER_POSITION_MAP.get(pid, "")
+            player_slot = normalize_position(raw_pos)
+            if player_slot != slot_norm:
+                continue
+
+        score = production_score_pergame(row)
+
+        candidates.append(
+            {
+                "id": pid,
+                "name": meta["name"],
+                "team": meta["team"],
+                "score": score,
+            }
+        )
+
+    return candidates
+
+
+# -----------------------
+# Admin endpoints to refresh caches
+# -----------------------
+@app.post("/admin/refresh_rosters")
+def refresh_rosters():
+    info = build_roster_maps(SEASON_2024_25)
+    return {"season": SEASON_2024_25, **info}
+
+@app.get("/admin/roster_count")
+def roster_count():
+    return {"season": SEASON_2024_25, "players": len(ROSTER_META)}
+
+@app.post("/admin/refresh_stats")
+def refresh_stats():
+    # forces stats fetch now
+    df = get_season_stats_df()
+    return {"season": SEASON_2024_25, "rows": int(df.shape[0])}
+
+
+# -----------------------
+# Startup: try to build rosters once, but never block server startup if it fails
+# -----------------------
+@app.on_event("startup")
+def on_startup():
+    try:
+        info = build_roster_maps(SEASON_2024_25)
+        print(f"[startup] roster loaded: {info}")
+    except Exception as e:
+        print(f"[startup] roster load failed: {e}")
+
+
 # -----------------------
 # Game endpoints
 # -----------------------
 @app.get("/game/cases")
 def generate_cases(seed: int = 1):
     """
-    Original behavior: 16 tiers (PerGame score), 16 random players (one per tier),
-    shuffled into cases 1..16.
+    16 tiers across ALL eligible roster players who have stats in 2024-25.
     """
-    df = get_league_leaders_pergame_df()
-
-    candidates = []
-    for _, row in df.iterrows():
-        try:
-            pid = int(row["PLAYER_ID"])
-            name = str(row["PLAYER"])
-        except Exception:
-            continue
-
-        team = str(row.get("TEAM", row.get("TEAM_ABBREVIATION", "Unknown")))
-        score = production_score_pergame(row)
-        candidates.append({"id": pid, "name": name, "team": team, "score": score})
-
+    candidates = build_candidates(slot=None)
     cases = build_case_pool_from_candidates(candidates, seed)
     return {"season": SEASON_2024_25, "seed": seed, "cases": cases}
 
@@ -245,35 +332,10 @@ def generate_cases(seed: int = 1):
 @app.get("/game/cases_by_slot")
 def generate_cases_by_slot(seed: int = 1, slot: str = "PG"):
     """
-    Position-specific pool:
-    - Slot is derived from CommonTeamRoster POSITION (official roster listing)
-    - Tiering uses PerGame score (unchanged)
+    16 tiers within a position slot, using roster position for slot eligibility,
+    and season per-game stats for tier score.
+    Excludes players with no stats automatically.
     """
-    slot = slot.upper().strip()
-    if slot not in {"PG", "SG", "SF", "PF", "C"}:
-        raise HTTPException(status_code=400, detail="slot must be one of PG, SG, SF, PF, C")
-
-    df = get_league_leaders_pergame_df()
-
-    candidates = []
-    for _, row in df.iterrows():
-        try:
-            pid = int(row["PLAYER_ID"])
-            name = str(row["PLAYER"])
-        except Exception:
-            continue
-
-        raw_pos: Optional[str] = POSITION_MAP.get(pid)
-        if not raw_pos:
-            continue
-
-        player_slot = normalize_position(raw_pos)
-        if player_slot != slot:
-            continue
-
-        team = str(row.get("TEAM", row.get("TEAM_ABBREVIATION", "Unknown")))
-        score = production_score_pergame(row)
-        candidates.append({"id": pid, "name": name, "team": team, "score": score})
-
+    candidates = build_candidates(slot=slot)
     cases = build_case_pool_from_candidates(candidates, seed)
-    return {"season": SEASON_2024_25, "seed": seed, "slot": slot, "cases": cases}
+    return {"season": SEASON_2024_25, "seed": seed, "slot": slot.upper().strip(), "cases": cases}
