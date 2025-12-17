@@ -32,7 +32,7 @@ type BankerOfferResponse = {
   player: CasePlayer;
 };
 
-const API_BASE = "https://deal-or-no-deal-backend-jkl0.onrender.com";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
 // Opening schedule: 4 then 3 then 3 then 2 then 2, then final choice
 const OPEN_SCHEDULE = [4, 3, 3, 2, 2] as const;
