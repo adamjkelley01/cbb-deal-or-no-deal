@@ -46,6 +46,9 @@ type Phase =
   | "done";
 
 export default function GamePage() {
+  useEffect(() => {
+    console.log("NEXT_PUBLIC_API_BASE =", process.env.NEXT_PUBLIC_API_BASE);
+  }, []);
   const [slot, setSlot] = useState<Slot>("PG");
   const [seed, setSeed] = useState<number>(7);
 
