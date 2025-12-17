@@ -49,6 +49,7 @@ export default function GamePage() {
   useEffect(() => {
     console.log("NEXT_PUBLIC_API_BASE =", process.env.NEXT_PUBLIC_API_BASE);
   }, []);
+
   const [slot, setSlot] = useState<Slot>("PG");
   const [seed, setSeed] = useState<number>(7);
 
@@ -193,7 +194,9 @@ export default function GamePage() {
     } catch {
       setCasePool(null);
       setPhase("idle");
-      setCasesError("Could not load cases. Make sure backend is running.");
+      setCasesError(
+        "Could not load cases. Backend may be sleeping, try again."
+      );
     } finally {
       setLoadingCases(false);
     }
@@ -235,7 +238,6 @@ export default function GamePage() {
       remainingToOpen === 0 &&
       reservedCaseNumber != null
     ) {
-      // entering offer phase: reset offer reveal state
       setPhase("banker_offer");
       setBankerOffer(null);
       setBankerOfferError(null);
@@ -372,13 +374,33 @@ export default function GamePage() {
   const canPickSlot =
     phase === "idle" || phase === "pick_reserved" || phase === "done";
 
+  // ---------- Styling helpers ----------
+  const panel =
+    "rounded-xl border border-slate-700/60 bg-slate-900/70 shadow-lg backdrop-blur";
+  const label = "block text-sm text-slate-200";
+  const input =
+    "mt-2 w-full rounded-md border border-slate-700 bg-slate-950/80 text-slate-100 p-2 outline-none focus:ring-2 focus:ring-slate-500/50 disabled:opacity-60";
+  const btnBase =
+    "rounded-md px-4 py-2 text-sm font-semibold transition disabled:opacity-50 disabled:cursor-not-allowed";
+  const btnPrimary =
+    btnBase + " bg-emerald-500 text-emerald-950 hover:bg-emerald-400";
+  const btnSecondary =
+    btnBase +
+    " bg-slate-700 text-slate-100 hover:bg-slate-600 border border-slate-600";
+  const btnInfo = btnBase + " bg-sky-500 text-sky-950 hover:bg-sky-400";
+  const btnDanger = btnBase + " bg-rose-500 text-rose-950 hover:bg-rose-400";
+  const btnOutline =
+    btnBase + " border border-slate-600 text-slate-100 hover:bg-slate-800";
+
   return (
-    <main className="min-h-screen p-8">
+    <main className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-950 to-slate-900 text-slate-100 p-8">
       <div className="mx-auto max-w-6xl space-y-6">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="text-3xl font-bold">Deal or No Deal</h1>
-            <p className="text-sm text-gray-400">
+            <h1 className="text-3xl font-extrabold tracking-tight">
+              Deal or No Deal
+            </h1>
+            <p className="text-sm text-slate-300 mt-1">
               Pick a position, generate 16 cases, then play through banker
               offers.
             </p>
@@ -386,7 +408,7 @@ export default function GamePage() {
 
           <div className="flex gap-2">
             <button
-              className="rounded-md border border-gray-700 px-4 py-2 text-sm"
+              className={btnSecondary}
               type="button"
               onClick={resetCurrentGameKeepRoster}
             >
@@ -394,7 +416,7 @@ export default function GamePage() {
             </button>
 
             <button
-              className="rounded-md border border-gray-700 px-4 py-2 text-sm"
+              className={btnDanger}
               type="button"
               onClick={resetEverything}
             >
@@ -406,17 +428,19 @@ export default function GamePage() {
         {/* Round message modal */}
         {casePool && phase === "open_round" && roundMessageOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-            <div className="w-full max-w-md rounded-lg border border-gray-800 bg-black p-5 space-y-3">
-              <div className="text-sm font-semibold">
+            <div className="w-full max-w-md rounded-xl border border-slate-700 bg-slate-950 p-5 space-y-3 shadow-2xl">
+              <div className="text-sm font-semibold text-slate-100">
                 Round {roundIndex + 1}
               </div>
-              <div className="text-sm text-gray-300">
+              <div className="text-sm text-slate-200">
                 Select and open{" "}
-                <span className="font-semibold">{remainingToOpen}</span>{" "}
+                <span className="font-bold text-emerald-400">
+                  {remainingToOpen}
+                </span>{" "}
                 case(s).
               </div>
               <button
-                className="rounded-md bg-white px-4 py-2 text-black font-medium"
+                className={btnPrimary}
                 type="button"
                 onClick={() => setRoundMessageOpen(false)}
               >
@@ -427,24 +451,28 @@ export default function GamePage() {
         )}
 
         {/* Starting Five */}
-        <div className="rounded-lg border border-gray-800 p-4">
-          <div className="mb-2 text-sm font-semibold">Starting Five</div>
+        <div className={panel + " p-4"}>
+          <div className="mb-2 text-sm font-semibold text-slate-100">
+            Starting Five
+          </div>
           <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
             {(["PG", "SG", "SF", "PF", "C"] as Slot[]).map((s) => {
               const p = startingFive[s];
               return (
                 <div
                   key={s}
-                  className="rounded-md border border-gray-800 p-3 text-sm"
+                  className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3 text-sm"
                 >
-                  <div className="text-xs text-gray-400">{s}</div>
+                  <div className="text-xs text-slate-300">{s}</div>
                   {p ? (
                     <div className="mt-1">
-                      <div className="font-medium">{p.name}</div>
-                      <div className="text-gray-400">{p.team}</div>
+                      <div className="font-semibold text-slate-100">
+                        {p.name}
+                      </div>
+                      <div className="text-slate-300">{p.team}</div>
                     </div>
                   ) : (
-                    <div className="mt-1 text-gray-500">Empty</div>
+                    <div className="mt-1 text-slate-400">Empty</div>
                   )}
                 </div>
               );
@@ -454,12 +482,12 @@ export default function GamePage() {
 
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
           {/* Left */}
-          <div className="lg:col-span-2 rounded-lg border border-gray-800 p-4 space-y-4">
+          <div className={panel + " lg:col-span-2 p-4 space-y-4"}>
             <div className="flex flex-col gap-3 md:flex-row md:items-end">
-              <label className="block text-sm">
+              <label className={label}>
                 Position
                 <select
-                  className="mt-2 w-full rounded-md border border-gray-800 bg-black p-2 disabled:opacity-60"
+                  className={input}
                   value={slot}
                   onChange={(e) => setSlot(e.target.value as Slot)}
                   disabled={!canPickSlot}
@@ -482,10 +510,10 @@ export default function GamePage() {
                 </select>
               </label>
 
-              <label className="block text-sm">
+              <label className={label}>
                 Seed
                 <input
-                  className="mt-2 w-full rounded-md border border-gray-800 bg-black p-2 disabled:opacity-60"
+                  className={input}
                   type="number"
                   value={seed}
                   onChange={(e) => setSeed(Number(e.target.value))}
@@ -494,7 +522,7 @@ export default function GamePage() {
               </label>
 
               <button
-                className="rounded-md bg-white px-4 py-2 text-black font-medium disabled:opacity-60"
+                className={btnPrimary}
                 type="button"
                 onClick={loadCases}
                 disabled={loadingCases || playedSlots.has(slot)}
@@ -504,16 +532,16 @@ export default function GamePage() {
             </div>
 
             {casesError && (
-              <div className="rounded-md border border-red-900 bg-red-950/30 p-3 text-sm text-red-300">
+              <div className="rounded-lg border border-rose-800/60 bg-rose-950/40 p-3 text-sm text-rose-200">
                 {casesError}
               </div>
             )}
 
-            <div className="rounded-md border border-gray-800 p-3 text-sm">
-              <div className="font-semibold">Status</div>
-              <div className="text-gray-400 mt-1">{instructionText}</div>
+            <div className="rounded-lg border border-slate-700/60 bg-slate-950/40 p-3 text-sm">
+              <div className="font-semibold text-slate-100">Status</div>
+              <div className="text-slate-200 mt-1">{instructionText}</div>
               {casePool && (
-                <div className="text-gray-500 mt-1">
+                <div className="text-slate-300 mt-1">
                   Remaining unopened: {remainingUnopenedCount}
                   {reservedCaseNumber != null
                     ? ` | Your case: ${reservedCaseNumber}`
@@ -537,15 +565,22 @@ export default function GamePage() {
                   const disabled =
                     !canClickCase || (phase === "open_round" && isReserved);
 
+                  const className = [
+                    "rounded-lg border px-3 py-3 text-sm font-semibold",
+                    "bg-slate-950/40 text-slate-100",
+                    isReserved
+                      ? "border-emerald-400/70"
+                      : "border-slate-700/60 hover:border-slate-500",
+                    disabled
+                      ? "opacity-50 cursor-not-allowed"
+                      : "cursor-pointer",
+                  ].join(" ");
+
                   return (
                     <button
                       key={c.case}
                       type="button"
-                      className={`rounded-md border px-3 py-3 text-sm ${
-                        isReserved
-                          ? "border-white"
-                          : "border-gray-800 hover:border-gray-600"
-                      } ${disabled ? "opacity-60 cursor-not-allowed" : ""}`}
+                      className={className}
                       onClick={() => {
                         if (disabled) return;
 
@@ -576,14 +611,16 @@ export default function GamePage() {
 
             {/* Last opened */}
             {casePool && lastOpened && (
-              <div className="rounded-md border border-gray-800 p-4 space-y-1">
-                <div className="text-sm font-semibold">Last opened</div>
-                <div className="text-sm text-gray-400">
+              <div className="rounded-xl border border-slate-700/60 bg-slate-950/40 p-4 space-y-1">
+                <div className="text-sm font-semibold text-slate-100">
+                  Last opened
+                </div>
+                <div className="text-sm text-slate-300">
                   Case {lastOpened.case} (tier {lastOpened.tier})
                 </div>
-                <div className="text-lg font-semibold">
+                <div className="text-lg font-bold text-slate-100">
                   {lastOpened.player.name}{" "}
-                  <span className="text-gray-400">
+                  <span className="text-slate-300 font-semibold">
                     - {lastOpened.player.team}
                   </span>
                 </div>
@@ -592,24 +629,26 @@ export default function GamePage() {
 
             {/* Banker offer */}
             {casePool && phase === "banker_offer" && (
-              <div className="rounded-md border border-gray-800 p-4 space-y-3">
-                <div className="text-sm font-semibold">Banker offer</div>
+              <div className="rounded-xl border border-slate-700/60 bg-slate-950/40 p-4 space-y-3">
+                <div className="text-sm font-semibold text-slate-100">
+                  Banker offer
+                </div>
 
                 {!offerRevealed ? (
-                  <div className="text-sm text-gray-400">
+                  <div className="text-sm text-slate-200">
                     The banker has an offer ready.
                   </div>
                 ) : bankerOffer ? (
-                  <div className="text-sm text-gray-300">
-                    The banker is willing to offer{" "}
-                    <span className="font-semibold">
+                  <div className="text-sm text-slate-200">
+                    The banker offers{" "}
+                    <span className="font-bold text-emerald-300">
                       {bankerOffer.player.name}
                     </span>{" "}
-                    <span className="text-gray-400">
+                    <span className="text-slate-300">
                       ({bankerOffer.player.team})
                     </span>{" "}
                     from tier{" "}
-                    <span className="font-semibold">
+                    <span className="font-bold text-sky-300">
                       {bankerOffer.picked_tier}
                     </span>
                     .
@@ -617,12 +656,14 @@ export default function GamePage() {
                 ) : null}
 
                 {bankerOfferError && (
-                  <div className="text-sm text-red-300">{bankerOfferError}</div>
+                  <div className="text-sm text-rose-200">
+                    {bankerOfferError}
+                  </div>
                 )}
 
                 <div className="flex gap-3 flex-wrap">
                   <button
-                    className="rounded-md border border-gray-700 px-4 py-2 text-sm disabled:opacity-60"
+                    className={btnInfo}
                     type="button"
                     onClick={revealOffer}
                     disabled={offerLoading || offerRevealed}
@@ -635,7 +676,7 @@ export default function GamePage() {
                   </button>
 
                   <button
-                    className="rounded-md bg-white px-4 py-2 text-black font-medium disabled:opacity-60"
+                    className={btnPrimary}
                     type="button"
                     onClick={acceptDeal}
                     disabled={!bankerOffer}
@@ -644,7 +685,7 @@ export default function GamePage() {
                   </button>
 
                   <button
-                    className="rounded-md border border-gray-700 px-4 py-2 text-sm"
+                    className={btnOutline}
                     type="button"
                     onClick={handleNoDeal}
                   >
@@ -658,24 +699,33 @@ export default function GamePage() {
             {casePool &&
               phase === "final_choice" &&
               reservedCaseNumber != null && (
-                <div className="rounded-md border border-gray-800 p-4 space-y-3">
-                  <div className="text-sm font-semibold">Final choice</div>
+                <div className="rounded-xl border border-slate-700/60 bg-slate-950/40 p-4 space-y-3">
+                  <div className="text-sm font-semibold text-slate-100">
+                    Final choice
+                  </div>
 
                   {!lastOtherUnopenedCase ? (
-                    <div className="text-sm text-gray-400">
+                    <div className="text-sm text-slate-200">
                       Waiting for exactly one other unopened case besides your
                       case.
                     </div>
                   ) : (
                     <>
-                      <div className="text-sm text-gray-400">
-                        Keep your case (#{reservedCaseNumber}) or switch to case
-                        (#{lastOtherUnopenedCase.case})?
+                      <div className="text-sm text-slate-200">
+                        Keep your case{" "}
+                        <span className="font-bold text-emerald-300">
+                          #{reservedCaseNumber}
+                        </span>{" "}
+                        or switch to{" "}
+                        <span className="font-bold text-sky-300">
+                          #{lastOtherUnopenedCase.case}
+                        </span>
+                        ?
                       </div>
 
                       <div className="flex gap-3">
                         <button
-                          className="rounded-md bg-white px-4 py-2 text-black font-medium"
+                          className={btnPrimary}
                           type="button"
                           onClick={keepReserved}
                         >
@@ -683,7 +733,7 @@ export default function GamePage() {
                         </button>
 
                         <button
-                          className="rounded-md border border-gray-700 px-4 py-2 text-sm"
+                          className={btnOutline}
                           type="button"
                           onClick={switchToOther}
                         >
@@ -697,9 +747,11 @@ export default function GamePage() {
 
             {/* Done */}
             {casePool && phase === "done" && (
-              <div className="rounded-md border border-gray-800 p-4 space-y-2">
-                <div className="text-sm font-semibold">Winner added</div>
-                <div className="text-sm text-gray-400">
+              <div className="rounded-xl border border-emerald-700/40 bg-emerald-950/20 p-4 space-y-2">
+                <div className="text-sm font-semibold text-emerald-200">
+                  Winner added
+                </div>
+                <div className="text-sm text-emerald-100/90">
                   Your chosen player has been added to {slot}. Start a new game
                   with a different position.
                 </div>
@@ -707,14 +759,14 @@ export default function GamePage() {
             )}
           </div>
 
-          {/* Right: always visible, never marks reserved */}
-          <div className="rounded-lg border border-gray-800 p-4 space-y-3">
-            <div className="text-sm font-semibold">
+          {/* Right list */}
+          <div className={panel + " p-4 space-y-3"}>
+            <div className="text-sm font-semibold text-slate-100">
               Generated players (ordered by tier)
             </div>
 
             {!casePool && (
-              <div className="text-sm text-gray-500">
+              <div className="text-sm text-slate-300">
                 Generate cases to see the 16 players here.
               </div>
             )}
@@ -723,25 +775,29 @@ export default function GamePage() {
               <div className="space-y-2 text-sm">
                 {tierList.map((c) => {
                   const opened = openedCaseNumbers.has(c.case);
-
                   return (
                     <div
                       key={c.case}
-                      className={`rounded-md border border-gray-900 p-2 ${
-                        opened ? "opacity-50" : ""
-                      }`}
+                      className={[
+                        "rounded-lg border p-2",
+                        "border-slate-700/60 bg-slate-950/40",
+                        opened ? "opacity-60" : "",
+                      ].join(" ")}
                     >
-                      <div className="text-xs text-gray-400">Tier {c.tier}</div>
+                      <div className="text-xs text-slate-300">
+                        Tier {c.tier}
+                      </div>
 
                       <div
-                        className={`font-medium ${
-                          opened ? "line-through text-gray-500" : ""
-                        }`}
+                        className={[
+                          "font-semibold text-slate-100",
+                          opened ? "line-through text-slate-300" : "",
+                        ].join(" ")}
                       >
                         {c.player.name}
                       </div>
 
-                      <div className="text-gray-400">{c.player.team}</div>
+                      <div className="text-slate-300">{c.player.team}</div>
                     </div>
                   );
                 })}
@@ -750,7 +806,7 @@ export default function GamePage() {
           </div>
         </div>
 
-        <div className="text-xs text-gray-500">
+        <div className="text-xs text-slate-400">
           Backend expected at {API_BASE}.
         </div>
       </div>
