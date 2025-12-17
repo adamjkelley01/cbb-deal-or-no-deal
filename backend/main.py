@@ -136,7 +136,7 @@ def split_into_16_tiers(players_sorted_desc: List[dict]) -> List[List[dict]]:
     n = len(players_sorted_desc)
     tiers: List[List[dict]] = [[] for _ in range(16)]
 
-    gamma = 2  # tune: 1.2 mild, 1.6 good start, 2.0 strong
+    gamma = 3  # tune: 1.2 mild, 1.6 good start, 2.0 strong
 
     for i, p in enumerate(players_sorted_desc):
         rank = 1.0 - (i / (n - 1) if n > 1 else 0.0)  # best=1, worst=0
