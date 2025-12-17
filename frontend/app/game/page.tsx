@@ -179,6 +179,8 @@ export default function GamePage() {
         seed
       )}&slot=${encodeURIComponent(slot)}`;
 
+      console.log("Fetching:", url);
+
       const res = await fetch(url);
       if (!res.ok) {
         const text = await res.text();
