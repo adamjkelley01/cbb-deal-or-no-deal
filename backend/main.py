@@ -13,11 +13,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_credentials=True,
+    allow_origins=["*"],          # allow Vercel + localhost + any origin
+    allow_credentials=False,      # must be False if allow_origins is "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 SEASON_2024_25 = "2024-25"
