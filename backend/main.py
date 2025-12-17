@@ -1,5 +1,5 @@
 import random
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Set
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,11 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from cachetools import TTLCache
 from nba_api.stats.static import players as nba_players
 from nba_api.stats.static import teams as nba_teams
-from nba_api.stats.endpoints import (
-    commonplayerinfo,
-    commonteamroster,
-    leaguedashplayerstats,
-)
+from nba_api.stats.endpoints import commonplayerinfo, commonteamroster, leaguedashplayerstats
 
 app = FastAPI()
 
@@ -24,6 +20,128 @@ app.add_middleware(
 )
 
 SEASON_2024_25 = "2024-25"
+
+# -----------------------
+# Helpers
+# -----------------------
+def height_to_inches(height_text: str) -> int:
+    """
+    '6-10' -> 82
+    '6-9' -> 81
+    """
+    try:
+        s = (height_text or "").strip()
+        if "-" not in s:
+            return 0
+        ft, inch = s.split("-", 1)
+        return int(ft) * 12 + int(inch)
+    except Exception:
+        return 0
+
+def parse_height_inches(height_text: str) -> int:
+    """
+    Converts NBA height strings like '6-8' into total inches.
+    Returns 0 if missing/invalid.
+    """
+    if not height_text:
+        return 0
+    s = str(height_text).strip()
+    if "-" not in s:
+        return 0
+    try:
+        feet_str, inch_str = s.split("-", 1)
+        return int(feet_str) * 12 + int(inch_str)
+    except Exception:
+        return 0
+
+
+def three_pt_pct(row) -> float:
+    """
+    Returns 3PT% as a percent number (0-100), not 0-1.
+    LeagueDashPlayerStats FG3_PCT is usually 0-1.
+    """
+    val = row.get("FG3_PCT", 0)
+    try:
+        v = float(val)
+    except Exception:
+        return 0.0
+
+    # If it looks like 0.35, convert to 35.0
+    return v * 100.0 if v <= 1.0 else v
+
+
+def normalize_position(raw_pos: str, height_text: str, fg3_pct_percent: float) -> str:
+    """
+    Derive PG / SG / SF / PF / C using roster position + height rules.
+    Adds extra SF rule for F:
+      - if shorter than 6'9 AND 3PT% >= 32% => SF
+      - else PF
+    """
+    p = (raw_pos or "").upper().strip()
+    h = parse_height_inches(height_text)
+
+    # F-C split
+    if p == "F-C":
+        return "C" if h >= 82 else "PF"  # 6'10" = 82 inches
+
+    # F split (UPDATED)
+    if p == "F":
+        if h >= 81:  # 6'9" = 81 inches
+            return "PF"
+        # shorter than 6'9"
+        return "SF" if fg3_pct_percent >= 32.0 else "PF"
+
+    # G-F split
+    if p == "G-F":
+        return "SF" if h >= 78 else "SG"  # 6'6" = 78 inches
+
+    # G split
+    if p == "G":
+        return "SG" if h >= 77 else "PG"  # 6'5" = 77 inches
+
+    # C stays C
+    if p == "C":
+        return "C"
+
+    # fallback
+    return "SF"
+
+
+
+def production_score_pergame(row) -> float:
+    pts = float(row.get("PTS", 0))
+    reb = float(row.get("REB", 0))
+    ast = float(row.get("AST", 0))
+    stl = float(row.get("STL", 0))
+    blk = float(row.get("BLK", 0))
+    tov = float(row.get("TOV", 0))
+    return pts + 1.2 * reb + 1.5 * ast + 3.0 * stl + 3.0 * blk - 2.0 * tov
+
+
+def clamp_tier(t: int) -> int:
+    return max(1, min(16, t))
+
+
+def split_into_16_tiers(players_sorted_desc: List[dict]) -> List[List[dict]]:
+    """
+    players_sorted_desc must already be sorted by score desc.
+    Returns tiers[0..15] each list of players in that tier.
+    """
+    n = len(players_sorted_desc)
+    tiers: List[List[dict]] = [[] for _ in range(16)]
+
+    gamma = 2  # tune: 1.2 mild, 1.6 good start, 2.0 strong
+
+    for i, p in enumerate(players_sorted_desc):
+        rank = 1.0 - (i / (n - 1) if n > 1 else 0.0)  # best=1, worst=0
+        tier_idx = 15 - int((rank ** gamma) * 16)     # best->0, worst->15
+        tier_idx = min(15, max(0, tier_idx))
+        tiers[tier_idx].append(p)
+
+    return tiers
+
+
+
 
 # -----------------------
 # Basic health
@@ -72,47 +190,13 @@ def search_players(q: str = Query(..., min_length=1), limit: int = 10):
 
 
 # -----------------------
-# Rosters and positions (source of truth for eligibility)
+# Rosters and positions (eligibility)
 # -----------------------
-# ROSTER_POSITION_MAP: player_id -> raw roster position ("G", "F", "C", "G-F", "F-C")
-ROSTER_POSITION_MAP: Dict[int, str] = {}
-# ROSTER_META: player_id -> {"name": ..., "team": ..., "raw_pos": ...}
+# ROSTER_META: player_id -> {"name": ..., "team": ..., "raw_pos": ..., "height": ...}
 ROSTER_META: Dict[int, Dict[str, str]] = {}
 
-def normalize_position(pos: str) -> str:
-    """
-    Convert NBA roster position strings into one of: PG, SG, SF, PF, C.
-
-    Note: Team rosters use coarse labels, not strict 1-5 positions.
-    This mapping is deterministic and easy to adjust if needed.
-    """
-    p = (pos or "").upper().strip()
-
-    if p == "C":
-        return "C"
-    if p == "F-C":
-        return "C"   # treat F-C as center so C pool is large enough
-    if p == "G-F":
-        return "SG"
-    if p == "F":
-        return "SF"
-    if p == "G":
-        return "PG"
-
-    return "SF"
-
-
 def build_roster_maps(season: str) -> Dict[str, int]:
-    """
-    Calls CommonTeamRoster once per NBA team.
-    Builds:
-      - ROSTER_POSITION_MAP
-      - ROSTER_META (name, team, raw_pos)
-
-    This defines who is eligible to appear in the game.
-    """
-    global ROSTER_POSITION_MAP, ROSTER_META
-    ROSTER_POSITION_MAP = {}
+    global ROSTER_META
     ROSTER_META = {}
 
     teams = nba_teams.get_teams()
@@ -131,37 +215,29 @@ def build_roster_maps(season: str) -> Dict[str, int]:
                 pid = int(row.get("PLAYER_ID"))
                 name = str(row.get("PLAYER", "")).strip()
                 raw_pos = str(row.get("POSITION", "")).strip()
+                height = str(row.get("HEIGHT", "")).strip()
             except Exception:
                 continue
 
             if not pid or not name:
                 continue
 
-            if raw_pos:
-                ROSTER_POSITION_MAP[pid] = raw_pos
-            else:
-                ROSTER_POSITION_MAP[pid] = ""
-
             ROSTER_META[pid] = {
                 "name": name,
                 "team": str(team_name),
                 "raw_pos": raw_pos,
+                "height": height,
             }
 
-    return {"players": len(ROSTER_META), "positions": len(ROSTER_POSITION_MAP), "teams": len(teams)}
+    return {"players": len(ROSTER_META), "teams": len(teams)}
 
 
 # -----------------------
-# Season stats (source of truth for tiering)
-# Exclude players with no stats by definition (not present in stats table or 0 GP / 0 MIN)
+# Season stats (tiering, excludes no-stats)
 # -----------------------
 STATS_CACHE = TTLCache(maxsize=2, ttl=60 * 60)  # 1 hour cache
 
 def get_season_stats_df():
-    """
-    LeagueDashPlayerStats returns a league-wide table of player stats for the season.
-    We use PerGame for tier score (same idea as your original approach).
-    """
     if SEASON_2024_25 in STATS_CACHE:
         return STATS_CACHE[SEASON_2024_25]
 
@@ -175,30 +251,73 @@ def get_season_stats_df():
     return df
 
 
-def production_score_pergame(row) -> float:
-    pts = float(row.get("PTS", 0))
-    reb = float(row.get("REB", 0))
-    ast = float(row.get("AST", 0))
-    stl = float(row.get("STL", 0))
-    blk = float(row.get("BLK", 0))
-    tov = float(row.get("TOV", 0))
-    return pts + 1.2 * reb + 1.5 * ast + 3.0 * stl + 3.0 * blk - 2.0 * tov
+def build_candidates(slot: Optional[str] = None) -> List[dict]:
+    """
+    Candidate pool rules:
+      1) Must have season stats row (2024-25)
+      2) Must be on a 2024-25 roster
+      3) If slot provided, must match normalized roster position (height rules)
+      4) Exclude players with no stats: GP > 0 and MIN > 0
+    """
+    df = get_season_stats_df()
+
+    slot_norm: Optional[str] = None
+    if slot is not None:
+        s = slot.upper().strip()
+        if s not in {"PG", "SG", "SF", "PF", "C"}:
+            raise HTTPException(status_code=400, detail="slot must be one of PG, SG, SF, PF, C")
+        slot_norm = s
+
+    if len(ROSTER_META) == 0:
+        raise HTTPException(status_code=503, detail="Roster map empty. Restart backend or call POST /admin/refresh_rosters.")
+
+    candidates: List[dict] = []
+
+    for _, row in df.iterrows():
+        try:
+            pid = int(row.get("PLAYER_ID"))
+        except Exception:
+            continue
+
+        meta = ROSTER_META.get(pid)
+        if not meta:
+            continue
+
+        gp = float(row.get("GP", 0))
+        min_pg = float(row.get("MIN", 0))
+        if gp <= 0 or min_pg <= 0:
+            continue
+
+        if slot_norm is not None:
+            raw_pos = meta.get("raw_pos", "")
+            height = meta.get("height", "")
+            fg3pct = three_pt_pct(row)
+            player_slot = normalize_position(raw_pos, height, fg3pct)
+            if player_slot != slot_norm:
+                continue
+
+        score = production_score_pergame(row)
+
+        candidates.append(
+            {
+                "id": pid,
+                "name": meta["name"],
+                "team": meta["team"],
+                "score": score,
+            }
+        )
+
+    return candidates
 
 
-def build_case_pool_from_candidates(candidates: List[dict], seed: int):
+def build_case_pool_from_candidates(candidates: List[dict], seed: int) -> List[dict]:
     candidates.sort(key=lambda x: x["score"], reverse=True)
-
     if len(candidates) < 16:
         raise HTTPException(status_code=400, detail=f"Not enough candidates. Found {len(candidates)}.")
 
-    tiers = [[] for _ in range(16)]
-    n = len(candidates)
-    for i, player in enumerate(candidates):
-        tier_idx = min(15, int(i * 16 / n))
-        tiers[tier_idx].append(player)
+    tiers = split_into_16_tiers(candidates)
 
     rng = random.Random(seed)
-
     chosen = []
     for tier_index, tier_players in enumerate(tiers, start=1):
         if not tier_players:
@@ -222,91 +341,23 @@ def build_case_pool_from_candidates(candidates: List[dict], seed: int):
     return cases
 
 
-def build_candidates(slot: Optional[str] = None) -> List[dict]:
-    """
-    Candidate pool rules:
-      1) Must have season stats (LeagueDashPlayerStats row)
-      2) Must be on a 2024-25 team roster (CommonTeamRoster)
-      3) If slot provided, must match normalized roster position
-      4) Exclude players with no stats: enforce GP > 0 and MIN > 0
-    """
-    df = get_season_stats_df()
-
-    slot_norm: Optional[str] = None
-    if slot is not None:
-        s = slot.upper().strip()
-        if s not in {"PG", "SG", "SF", "PF", "C"}:
-            raise HTTPException(status_code=400, detail="slot must be one of PG, SG, SF, PF, C")
-        slot_norm = s
-
-    if len(ROSTER_META) == 0:
-        raise HTTPException(
-            status_code=503,
-            detail="Roster map is empty. Call POST /admin/refresh_rosters then retry.",
-        )
-
-    candidates: List[dict] = []
-
-    for _, row in df.iterrows():
-        try:
-            pid = int(row.get("PLAYER_ID"))
-        except Exception:
-            continue
-
-        # must be on roster
-        meta = ROSTER_META.get(pid)
-        if not meta:
-            continue
-
-        # must have actually played (exclude no-stats and zero-minute rows)
-        gp = float(row.get("GP", 0))
-        min_pg = float(row.get("MIN", 0))
-        if gp <= 0 or min_pg <= 0:
-            continue
-
-        # slot filter (based on roster position)
-        if slot_norm is not None:
-            raw_pos = ROSTER_POSITION_MAP.get(pid, "")
-            player_slot = normalize_position(raw_pos)
-            if player_slot != slot_norm:
-                continue
-
-        score = production_score_pergame(row)
-
-        candidates.append(
-            {
-                "id": pid,
-                "name": meta["name"],
-                "team": meta["team"],
-                "score": score,
-            }
-        )
-
-    return candidates
-
-
 # -----------------------
-# Admin endpoints to refresh caches
+# Admin
 # -----------------------
 @app.post("/admin/refresh_rosters")
 def refresh_rosters():
     info = build_roster_maps(SEASON_2024_25)
     return {"season": SEASON_2024_25, **info}
 
+@app.post("/admin/refresh_stats")
+def refresh_stats():
+    df = get_season_stats_df()
+    return {"season": SEASON_2024_25, "rows": int(df.shape[0])}
+
 @app.get("/admin/roster_count")
 def roster_count():
     return {"season": SEASON_2024_25, "players": len(ROSTER_META)}
 
-@app.post("/admin/refresh_stats")
-def refresh_stats():
-    # forces stats fetch now
-    df = get_season_stats_df()
-    return {"season": SEASON_2024_25, "rows": int(df.shape[0])}
-
-
-# -----------------------
-# Startup: try to build rosters once, but never block server startup if it fails
-# -----------------------
 @app.on_event("startup")
 def on_startup():
     try:
@@ -319,23 +370,71 @@ def on_startup():
 # -----------------------
 # Game endpoints
 # -----------------------
-@app.get("/game/cases")
-def generate_cases(seed: int = 1):
-    """
-    16 tiers across ALL eligible roster players who have stats in 2024-25.
-    """
-    candidates = build_candidates(slot=None)
-    cases = build_case_pool_from_candidates(candidates, seed)
-    return {"season": SEASON_2024_25, "seed": seed, "cases": cases}
-
-
 @app.get("/game/cases_by_slot")
 def generate_cases_by_slot(seed: int = 1, slot: str = "PG"):
-    """
-    16 tiers within a position slot, using roster position for slot eligibility,
-    and season per-game stats for tier score.
-    Excludes players with no stats automatically.
-    """
     candidates = build_candidates(slot=slot)
     cases = build_case_pool_from_candidates(candidates, seed)
     return {"season": SEASON_2024_25, "seed": seed, "slot": slot.upper().strip(), "cases": cases}
+
+
+@app.get("/game/banker_offer")
+def banker_offer(
+    slot: str = Query(..., min_length=1),
+    target_tier: int = Query(..., ge=1, le=16),
+    seed: int = 1,
+    exclude_ids: str = "",
+):
+    """
+    Returns ONE random player from the requested tier, from the FULL candidate pool
+    for that slot, excluding players already used in the current 16-case set.
+
+    exclude_ids: comma-separated player IDs
+    """
+    slot_norm = slot.upper().strip()
+    if slot_norm not in {"PG", "SG", "SF", "PF", "C"}:
+        raise HTTPException(status_code=400, detail="slot must be one of PG, SG, SF, PF, C")
+
+    exclude: Set[int] = set()
+    if exclude_ids.strip():
+        for part in exclude_ids.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                exclude.add(int(part))
+            except Exception:
+                continue
+
+    candidates = build_candidates(slot=slot_norm)
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    if len(candidates) < 16:
+        raise HTTPException(status_code=400, detail=f"Not enough candidates for slot {slot_norm}.")
+
+    tiers = split_into_16_tiers(candidates)
+
+    rng = random.Random(seed)
+
+    # try requested tier first, then expand outward if needed
+    desired = clamp_tier(int(target_tier))
+    tier_order = [desired]
+    for d in range(1, 16):
+        lo = desired - d
+        hi = desired + d
+        if lo >= 1:
+            tier_order.append(lo)
+        if hi <= 16:
+            tier_order.append(hi)
+
+    for t in tier_order:
+        pool = [p for p in tiers[t - 1] if int(p["id"]) not in exclude]
+        if pool:
+            pick = rng.choice(pool)
+            return {
+                "season": SEASON_2024_25,
+                "slot": slot_norm,
+                "target_tier": desired,
+                "picked_tier": t,
+                "player": {"id": pick["id"], "name": pick["name"], "team": pick["team"]},
+            }
+
+    raise HTTPException(status_code=404, detail="No available banker offer found after exclusions.")

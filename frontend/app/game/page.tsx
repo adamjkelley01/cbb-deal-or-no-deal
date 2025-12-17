@@ -1,14 +1,14 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-type Player = {
+type Slot = "PG" | "SG" | "SF" | "PF" | "C";
+
+type CasePlayer = {
   id: number;
   name: string;
   team: string;
 };
-
-type CasePlayer = { id: number; name: string; team: string };
 
 type GameCase = {
   case: number;
@@ -20,158 +20,733 @@ type GameCase = {
 type CasePoolResponse = {
   season: string;
   seed: number;
+  slot: Slot;
   cases: GameCase[];
 };
 
+type BankerOfferResponse = {
+  season: string;
+  slot: Slot;
+  target_tier: number;
+  picked_tier: number;
+  player: CasePlayer;
+};
+
+const API_BASE = "http://127.0.0.1:8000";
+
+// Opening schedule: 4 then 3 then 3 then 2 then 2, then final choice
+const OPEN_SCHEDULE = [4, 3, 3, 2, 2] as const;
+
+type Phase =
+  | "idle"
+  | "pick_reserved"
+  | "open_round"
+  | "banker_offer"
+  | "final_choice"
+  | "done";
+
 export default function GamePage() {
-  const [query, setQuery] = useState("");
-  const [players, setPlayers] = useState<Player[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [slot, setSlot] = useState<Slot>("PG");
+  const [seed, setSeed] = useState<number>(7);
 
   const [casePool, setCasePool] = useState<CasePoolResponse | null>(null);
-  const [caseLoading, setCaseLoading] = useState(false);
-  const [caseError, setCaseError] = useState<string | null>(null);
+  const [loadingCases, setLoadingCases] = useState(false);
+  const [casesError, setCasesError] = useState<string | null>(null);
 
-  async function generateCasePool(seed: number) {
-    setCaseLoading(true);
-    setCaseError(null);
+  const [openedCaseNumbers, setOpenedCaseNumbers] = useState<Set<number>>(
+    new Set()
+  );
+  const [reservedCaseNumber, setReservedCaseNumber] = useState<number | null>(
+    null
+  );
+
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [roundIndex, setRoundIndex] = useState<number>(0);
+  const [remainingToOpen, setRemainingToOpen] = useState<number>(0);
+
+  const [roundMessageOpen, setRoundMessageOpen] = useState(false);
+
+  const [lastOpened, setLastOpened] = useState<GameCase | null>(null);
+
+  const [startingFive, setStartingFive] = useState<
+    Partial<Record<Slot, CasePlayer>>
+  >({});
+
+  const [bankerOffer, setBankerOffer] = useState<BankerOfferResponse | null>(
+    null
+  );
+  const [bankerOfferError, setBankerOfferError] = useState<string | null>(null);
+  const [offerRevealed, setOfferRevealed] = useState(false);
+  const [offerLoading, setOfferLoading] = useState(false);
+
+  // slots already completed
+  const playedSlots = useMemo(() => {
+    const keys = Object.keys(startingFive) as Slot[];
+    return new Set<Slot>(keys.filter((k) => startingFive[k] != null));
+  }, [startingFive]);
+
+  const casesByCaseNumber = useMemo(() => {
+    if (!casePool) return [];
+    return casePool.cases.slice().sort((a, b) => a.case - b.case);
+  }, [casePool]);
+
+  const tierList = useMemo(() => {
+    if (!casePool) return [];
+    return casePool.cases.slice().sort((a, b) => a.tier - b.tier);
+  }, [casePool]);
+
+  const unopenedCases = useMemo(() => {
+    if (!casePool) return [];
+    return casePool.cases.filter((c) => !openedCaseNumbers.has(c.case));
+  }, [casePool, openedCaseNumbers]);
+
+  const remainingUnopenedCount = unopenedCases.length;
+
+  const lastOtherUnopenedCase = useMemo(() => {
+    if (!casePool) return null;
+    const remaining = casePool.cases.filter(
+      (c) => !openedCaseNumbers.has(c.case) && c.case !== reservedCaseNumber
+    );
+    if (remaining.length === 1) return remaining[0];
+    return null;
+  }, [casePool, openedCaseNumbers, reservedCaseNumber]);
+
+  const initialGamePlayerIds = useMemo(() => {
+    if (!casePool) return [];
+    return casePool.cases.map((c) => c.player.id);
+  }, [casePool]);
+
+  function resetEverything() {
+    setCasePool(null);
+    setOpenedCaseNumbers(new Set());
+    setReservedCaseNumber(null);
+    setPhase("idle");
+    setRoundIndex(0);
+    setRemainingToOpen(0);
+    setRoundMessageOpen(false);
+    setLastOpened(null);
+    setCasesError(null);
+
+    setBankerOffer(null);
+    setBankerOfferError(null);
+    setOfferRevealed(false);
+    setOfferLoading(false);
+
+    setStartingFive({});
+    setSlot("PG");
+    setSeed(7);
+  }
+
+  function resetCurrentGameKeepRoster() {
+    setCasePool(null);
+    setOpenedCaseNumbers(new Set());
+    setReservedCaseNumber(null);
+    setPhase("idle");
+    setRoundIndex(0);
+    setRemainingToOpen(0);
+    setRoundMessageOpen(false);
+    setLastOpened(null);
+    setCasesError(null);
+
+    setBankerOffer(null);
+    setBankerOfferError(null);
+    setOfferRevealed(false);
+    setOfferLoading(false);
+  }
+
+  async function loadCases() {
+    setLoadingCases(true);
+    setCasesError(null);
+
+    setOpenedCaseNumbers(new Set());
+    setReservedCaseNumber(null);
+    setPhase("idle");
+    setRoundIndex(0);
+    setRemainingToOpen(0);
+    setRoundMessageOpen(false);
+    setLastOpened(null);
+
+    setBankerOffer(null);
+    setBankerOfferError(null);
+    setOfferRevealed(false);
+    setOfferLoading(false);
 
     try {
-      const res = await fetch(`http://127.0.0.1:8000/game/cases?seed=${seed}`);
-      if (!res.ok) throw new Error(`Backend error: ${res.status}`);
-      const data: CasePoolResponse = await res.json();
+      const url = `${API_BASE}/game/cases_by_slot?seed=${encodeURIComponent(
+        seed
+      )}&slot=${encodeURIComponent(slot)}`;
+
+      const res = await fetch(url);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "Request failed");
+      }
+
+      const data = (await res.json()) as CasePoolResponse;
       setCasePool(data);
-    } catch (e) {
-      if (e instanceof Error) {
-        setCaseError(e.message);
-      } else {
-        setCaseError("Failed to load case pool");
-      }
+      setPhase("pick_reserved");
+    } catch {
       setCasePool(null);
+      setPhase("idle");
+      setCasesError("Could not load cases. Make sure backend is running.");
     } finally {
-      setCaseLoading(false);
+      setLoadingCases(false);
     }
   }
 
-  async function searchPlayers() {
-    if (!query) return;
+  function startAfterReservedPick(caseNumber: number) {
+    setReservedCaseNumber(caseNumber);
 
-    setLoading(true);
-    setError(null);
+    const first = OPEN_SCHEDULE[0];
+    setRoundIndex(0);
+    setRemainingToOpen(first);
+    setPhase("open_round");
+
+    setRoundMessageOpen(true);
+  }
+
+  function openCase(caseNumber: number) {
+    if (!casePool) return;
+    if (reservedCaseNumber != null && caseNumber === reservedCaseNumber) return;
+    if (openedCaseNumbers.has(caseNumber)) return;
+
+    const found = casePool.cases.find((c) => c.case === caseNumber);
+    if (!found) return;
+
+    setOpenedCaseNumbers((prev) => {
+      const next = new Set(prev);
+      next.add(caseNumber);
+      return next;
+    });
+
+    setLastOpened(found);
+    setRemainingToOpen((prev) => Math.max(0, prev - 1));
+  }
+
+  // round end -> banker_offer (no setState during render)
+  useEffect(() => {
+    if (
+      phase === "open_round" &&
+      remainingToOpen === 0 &&
+      reservedCaseNumber != null
+    ) {
+      // entering offer phase: reset offer reveal state
+      setPhase("banker_offer");
+      setBankerOffer(null);
+      setBankerOfferError(null);
+      setOfferRevealed(false);
+      setOfferLoading(false);
+    }
+  }, [phase, remainingToOpen, reservedCaseNumber]);
+
+  async function revealOffer() {
+    if (!casePool) return;
+    if (phase !== "banker_offer") return;
+    if (offerLoading) return;
+    if (offerRevealed && bankerOffer) return;
+
+    setOfferLoading(true);
+    setBankerOffer(null);
+    setBankerOfferError(null);
+
+    const remaining = casePool.cases.filter(
+      (c) => !openedCaseNumbers.has(c.case)
+    ); // includes reserved
+
+    if (remaining.length === 0) {
+      setBankerOfferError("No remaining cases to compute an offer.");
+      setOfferLoading(false);
+      return;
+    }
+
+    const avgTierRaw =
+      remaining.reduce((sum, c) => sum + c.tier, 0) / remaining.length;
+
+    const targetTier = Math.max(1, Math.min(16, Math.round(avgTierRaw)));
+    const exclude = initialGamePlayerIds.join(",");
+    const offerSeed = seed * 100 + roundIndex + 1;
 
     try {
-      const response = await fetch(
-        `http://127.0.0.1:8000/players/search?q=${encodeURIComponent(query)}`
-      );
+      const url = `${API_BASE}/game/banker_offer?slot=${encodeURIComponent(
+        slot
+      )}&target_tier=${encodeURIComponent(
+        targetTier
+      )}&seed=${encodeURIComponent(offerSeed)}&exclude_ids=${encodeURIComponent(
+        exclude
+      )}`;
 
-      if (!response.ok) throw new Error(`Request failed: ${response.status}`);
-
-      const data = await response.json();
-      setPlayers(data.players ?? []);
-    } catch (err) {
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError("Something went wrong. Please try again.");
+      const res = await fetch(url);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || "Offer request failed");
       }
-      setPlayers([]);
+
+      const data = (await res.json()) as BankerOfferResponse;
+      setBankerOffer(data);
+      setOfferRevealed(true);
+    } catch {
+      setBankerOfferError("Could not load banker offer.");
     } finally {
-      setLoading(false);
+      setOfferLoading(false);
     }
   }
+
+  function handleNoDeal() {
+    setBankerOffer(null);
+    setBankerOfferError(null);
+    setOfferRevealed(false);
+    setOfferLoading(false);
+
+    const nextRound = roundIndex + 1;
+
+    if (nextRound >= OPEN_SCHEDULE.length) {
+      setPhase("final_choice");
+      return;
+    }
+
+    setRoundIndex(nextRound);
+    setRemainingToOpen(OPEN_SCHEDULE[nextRound]);
+    setPhase("open_round");
+    setRoundMessageOpen(true);
+  }
+
+  function acceptDeal() {
+    if (!bankerOffer) return;
+
+    setStartingFive((prev) => ({
+      ...prev,
+      [slot]: bankerOffer.player,
+    }));
+
+    setPhase("done");
+  }
+
+  function finalizeWithCase(chosenCase: GameCase) {
+    setOpenedCaseNumbers((prev) => {
+      const next = new Set(prev);
+      next.add(chosenCase.case);
+      return next;
+    });
+
+    setStartingFive((prev) => ({
+      ...prev,
+      [slot]: chosenCase.player,
+    }));
+
+    setLastOpened(chosenCase);
+    setPhase("done");
+  }
+
+  function keepReserved() {
+    if (!casePool || reservedCaseNumber == null) return;
+    const c = casePool.cases.find((x) => x.case === reservedCaseNumber);
+    if (!c) return;
+    finalizeWithCase(c);
+  }
+
+  function switchToOther() {
+    if (!lastOtherUnopenedCase) return;
+    finalizeWithCase(lastOtherUnopenedCase);
+  }
+
+  const instructionText = useMemo(() => {
+    if (!casePool) return "Generate cases to begin.";
+    if (phase === "pick_reserved")
+      return "Pick 1 case to set aside until the end.";
+    if (phase === "open_round")
+      return `Open ${remainingToOpen} case(s) this round.`;
+    if (phase === "banker_offer") return "Banker offer time.";
+    if (phase === "final_choice")
+      return "Final choice: keep your case or switch.";
+    if (phase === "done")
+      return "Game complete. Your player has been added to your Starting Five.";
+    return "";
+  }, [casePool, phase, remainingToOpen]);
+
+  const canClickCase = phase === "pick_reserved" || phase === "open_round";
+  const canPickSlot =
+    phase === "idle" || phase === "pick_reserved" || phase === "done";
 
   return (
     <main className="min-h-screen p-8">
-      <div className="mx-auto max-w-4xl space-y-6">
-        <h1 className="text-3xl font-bold">Deal or No Deal</h1>
+      <div className="mx-auto max-w-6xl space-y-6">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold">Deal or No Deal</h1>
+            <p className="text-sm text-gray-400">
+              Pick a position, generate 16 cases, then play through banker
+              offers.
+            </p>
+          </div>
 
-        <p className="text-sm text-gray-400">
-          NBA version: generate a 16-case pool (one player per tier) from
-          2024-25 production, then play Deal or No Deal.
-        </p>
-
-        <div className="rounded-lg border border-gray-800 p-4 space-y-3">
-          <div className="flex items-center gap-2">
+          <div className="flex gap-2">
             <button
+              className="rounded-md border border-gray-700 px-4 py-2 text-sm"
               type="button"
-              onClick={() => generateCasePool(7)}
-              className="rounded-md bg-white px-4 py-2 text-black font-medium"
-              disabled={caseLoading}
+              onClick={resetCurrentGameKeepRoster}
             >
-              {caseLoading ? "Generating..." : "Generate 16 Cases"}
+              New game
             </button>
 
+            <button
+              className="rounded-md border border-gray-700 px-4 py-2 text-sm"
+              type="button"
+              onClick={resetEverything}
+            >
+              Reset everything
+            </button>
+          </div>
+        </div>
+
+        {/* Round message modal */}
+        {casePool && phase === "open_round" && roundMessageOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+            <div className="w-full max-w-md rounded-lg border border-gray-800 bg-black p-5 space-y-3">
+              <div className="text-sm font-semibold">
+                Round {roundIndex + 1}
+              </div>
+              <div className="text-sm text-gray-300">
+                Select and open{" "}
+                <span className="font-semibold">{remainingToOpen}</span>{" "}
+                case(s).
+              </div>
+              <button
+                className="rounded-md bg-white px-4 py-2 text-black font-medium"
+                type="button"
+                onClick={() => setRoundMessageOpen(false)}
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Starting Five */}
+        <div className="rounded-lg border border-gray-800 p-4">
+          <div className="mb-2 text-sm font-semibold">Starting Five</div>
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-5">
+            {(["PG", "SG", "SF", "PF", "C"] as Slot[]).map((s) => {
+              const p = startingFive[s];
+              return (
+                <div
+                  key={s}
+                  className="rounded-md border border-gray-800 p-3 text-sm"
+                >
+                  <div className="text-xs text-gray-400">{s}</div>
+                  {p ? (
+                    <div className="mt-1">
+                      <div className="font-medium">{p.name}</div>
+                      <div className="text-gray-400">{p.team}</div>
+                    </div>
+                  ) : (
+                    <div className="mt-1 text-gray-500">Empty</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+          {/* Left */}
+          <div className="lg:col-span-2 rounded-lg border border-gray-800 p-4 space-y-4">
+            <div className="flex flex-col gap-3 md:flex-row md:items-end">
+              <label className="block text-sm">
+                Position
+                <select
+                  className="mt-2 w-full rounded-md border border-gray-800 bg-black p-2 disabled:opacity-60"
+                  value={slot}
+                  onChange={(e) => setSlot(e.target.value as Slot)}
+                  disabled={!canPickSlot}
+                >
+                  <option value="PG" disabled={playedSlots.has("PG")}>
+                    PG {playedSlots.has("PG") ? "(completed)" : ""}
+                  </option>
+                  <option value="SG" disabled={playedSlots.has("SG")}>
+                    SG {playedSlots.has("SG") ? "(completed)" : ""}
+                  </option>
+                  <option value="SF" disabled={playedSlots.has("SF")}>
+                    SF {playedSlots.has("SF") ? "(completed)" : ""}
+                  </option>
+                  <option value="PF" disabled={playedSlots.has("PF")}>
+                    PF {playedSlots.has("PF") ? "(completed)" : ""}
+                  </option>
+                  <option value="C" disabled={playedSlots.has("C")}>
+                    C {playedSlots.has("C") ? "(completed)" : ""}
+                  </option>
+                </select>
+              </label>
+
+              <label className="block text-sm">
+                Seed
+                <input
+                  className="mt-2 w-full rounded-md border border-gray-800 bg-black p-2 disabled:opacity-60"
+                  type="number"
+                  value={seed}
+                  onChange={(e) => setSeed(Number(e.target.value))}
+                  disabled={!canPickSlot}
+                />
+              </label>
+
+              <button
+                className="rounded-md bg-white px-4 py-2 text-black font-medium disabled:opacity-60"
+                type="button"
+                onClick={loadCases}
+                disabled={loadingCases || playedSlots.has(slot)}
+              >
+                {loadingCases ? "Loading..." : "Generate 16 cases"}
+              </button>
+            </div>
+
+            {casesError && (
+              <div className="rounded-md border border-red-900 bg-red-950/30 p-3 text-sm text-red-300">
+                {casesError}
+              </div>
+            )}
+
+            <div className="rounded-md border border-gray-800 p-3 text-sm">
+              <div className="font-semibold">Status</div>
+              <div className="text-gray-400 mt-1">{instructionText}</div>
+              {casePool && (
+                <div className="text-gray-500 mt-1">
+                  Remaining unopened: {remainingUnopenedCount}
+                  {reservedCaseNumber != null
+                    ? ` | Your case: ${reservedCaseNumber}`
+                    : ""}
+                  {phase === "open_round"
+                    ? ` | Round ${roundIndex + 1}/${OPEN_SCHEDULE.length}`
+                    : ""}
+                </div>
+              )}
+            </div>
+
+            {/* Cases grid */}
             {casePool && (
-              <div className="text-sm text-gray-400">
-                Season: <span className="text-gray-200">{casePool.season}</span>{" "}
-                | Seed: <span className="text-gray-200">{casePool.seed}</span>
+              <div className="grid grid-cols-4 gap-3 md:grid-cols-8">
+                {casesByCaseNumber.map((c) => {
+                  const opened = openedCaseNumbers.has(c.case);
+                  const isReserved = reservedCaseNumber === c.case;
+
+                  if (opened) return null;
+
+                  const disabled =
+                    !canClickCase || (phase === "open_round" && isReserved);
+
+                  return (
+                    <button
+                      key={c.case}
+                      type="button"
+                      className={`rounded-md border px-3 py-3 text-sm ${
+                        isReserved
+                          ? "border-white"
+                          : "border-gray-800 hover:border-gray-600"
+                      } ${disabled ? "opacity-60 cursor-not-allowed" : ""}`}
+                      onClick={() => {
+                        if (disabled) return;
+
+                        if (phase === "pick_reserved") {
+                          startAfterReservedPick(c.case);
+                          return;
+                        }
+
+                        if (phase === "open_round") {
+                          if (remainingToOpen <= 0) return;
+                          openCase(c.case);
+                        }
+                      }}
+                      title={
+                        phase === "pick_reserved"
+                          ? "Pick this as your case"
+                          : isReserved
+                          ? "This is your case (saved for the end)"
+                          : ""
+                      }
+                    >
+                      {isReserved ? `Your case ${c.case}` : `Case ${c.case}`}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Last opened */}
+            {casePool && lastOpened && (
+              <div className="rounded-md border border-gray-800 p-4 space-y-1">
+                <div className="text-sm font-semibold">Last opened</div>
+                <div className="text-sm text-gray-400">
+                  Case {lastOpened.case} (tier {lastOpened.tier})
+                </div>
+                <div className="text-lg font-semibold">
+                  {lastOpened.player.name}{" "}
+                  <span className="text-gray-400">
+                    - {lastOpened.player.team}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Banker offer */}
+            {casePool && phase === "banker_offer" && (
+              <div className="rounded-md border border-gray-800 p-4 space-y-3">
+                <div className="text-sm font-semibold">Banker offer</div>
+
+                {!offerRevealed ? (
+                  <div className="text-sm text-gray-400">
+                    The banker has an offer ready.
+                  </div>
+                ) : bankerOffer ? (
+                  <div className="text-sm text-gray-300">
+                    The banker is willing to offer{" "}
+                    <span className="font-semibold">
+                      {bankerOffer.player.name}
+                    </span>{" "}
+                    <span className="text-gray-400">
+                      ({bankerOffer.player.team})
+                    </span>{" "}
+                    from tier{" "}
+                    <span className="font-semibold">
+                      {bankerOffer.picked_tier}
+                    </span>
+                    .
+                  </div>
+                ) : null}
+
+                {bankerOfferError && (
+                  <div className="text-sm text-red-300">{bankerOfferError}</div>
+                )}
+
+                <div className="flex gap-3 flex-wrap">
+                  <button
+                    className="rounded-md border border-gray-700 px-4 py-2 text-sm disabled:opacity-60"
+                    type="button"
+                    onClick={revealOffer}
+                    disabled={offerLoading || offerRevealed}
+                  >
+                    {offerLoading
+                      ? "Revealing..."
+                      : offerRevealed
+                      ? "Offer revealed"
+                      : "Reveal offer"}
+                  </button>
+
+                  <button
+                    className="rounded-md bg-white px-4 py-2 text-black font-medium disabled:opacity-60"
+                    type="button"
+                    onClick={acceptDeal}
+                    disabled={!bankerOffer}
+                  >
+                    Deal
+                  </button>
+
+                  <button
+                    className="rounded-md border border-gray-700 px-4 py-2 text-sm"
+                    type="button"
+                    onClick={handleNoDeal}
+                  >
+                    No deal
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Final choice */}
+            {casePool &&
+              phase === "final_choice" &&
+              reservedCaseNumber != null && (
+                <div className="rounded-md border border-gray-800 p-4 space-y-3">
+                  <div className="text-sm font-semibold">Final choice</div>
+
+                  {!lastOtherUnopenedCase ? (
+                    <div className="text-sm text-gray-400">
+                      Waiting for exactly one other unopened case besides your
+                      case.
+                    </div>
+                  ) : (
+                    <>
+                      <div className="text-sm text-gray-400">
+                        Keep your case (#{reservedCaseNumber}) or switch to case
+                        (#{lastOtherUnopenedCase.case})?
+                      </div>
+
+                      <div className="flex gap-3">
+                        <button
+                          className="rounded-md bg-white px-4 py-2 text-black font-medium"
+                          type="button"
+                          onClick={keepReserved}
+                        >
+                          Keep my case
+                        </button>
+
+                        <button
+                          className="rounded-md border border-gray-700 px-4 py-2 text-sm"
+                          type="button"
+                          onClick={switchToOther}
+                        >
+                          Switch
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+            {/* Done */}
+            {casePool && phase === "done" && (
+              <div className="rounded-md border border-gray-800 p-4 space-y-2">
+                <div className="text-sm font-semibold">Winner added</div>
+                <div className="text-sm text-gray-400">
+                  Your chosen player has been added to {slot}. Start a new game
+                  with a different position.
+                </div>
               </div>
             )}
           </div>
 
-          {caseError && <div className="text-sm text-red-400">{caseError}</div>}
-
-          {casePool && (
-            <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              {casePool.cases
-                .slice()
-                .sort((a, b) => a.case - b.case)
-                .map((c) => (
-                  <div
-                    key={c.case}
-                    className="rounded-lg border border-gray-800 p-3"
-                  >
-                    <div className="text-xs text-gray-400">Case {c.case}</div>
-                    <div className="font-semibold text-gray-100">
-                      {c.player.name}
-                    </div>
-                    <div className="text-sm text-gray-300">{c.player.team}</div>
-                    <div className="text-xs text-gray-400">
-                      Tier {c.tier} | Score {c.score}
-                    </div>
-                  </div>
-                ))}
+          {/* Right: always visible, never marks reserved */}
+          <div className="rounded-lg border border-gray-800 p-4 space-y-3">
+            <div className="text-sm font-semibold">
+              Generated players (ordered by tier)
             </div>
-          )}
-        </div>
 
-        <div className="rounded-lg border border-gray-800 p-4 space-y-3">
-          <label className="block text-sm font-medium">
-            Player search
-            <input
-              className="mt-2 w-full rounded-md border border-gray-800 bg-black p-2"
-              placeholder="Type a player name..."
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-          </label>
-
-          <button
-            className="rounded-md bg-white px-4 py-2 text-black font-medium"
-            type="button"
-            onClick={searchPlayers}
-          >
-            Search
-          </button>
-
-          <div className="rounded-md border border-gray-800 p-3 text-sm">
-            {loading && <div className="text-gray-400">Searching…</div>}
-
-            {error && <div className="text-red-400">{error}</div>}
-
-            {!loading && !error && players.length === 0 && (
-              <div className="text-gray-400">No results yet.</div>
+            {!casePool && (
+              <div className="text-sm text-gray-500">
+                Generate cases to see the 16 players here.
+              </div>
             )}
 
-            {!loading &&
-              !error &&
-              players.map((player) => (
-                <div key={player.id}>
-                  {player.name} — {player.team}
-                </div>
-              ))}
+            {casePool && (
+              <div className="space-y-2 text-sm">
+                {tierList.map((c) => {
+                  const opened = openedCaseNumbers.has(c.case);
+
+                  return (
+                    <div
+                      key={c.case}
+                      className={`rounded-md border border-gray-900 p-2 ${
+                        opened ? "opacity-50" : ""
+                      }`}
+                    >
+                      <div className="text-xs text-gray-400">Tier {c.tier}</div>
+
+                      <div
+                        className={`font-medium ${
+                          opened ? "line-through text-gray-500" : ""
+                        }`}
+                      >
+                        {c.player.name}
+                      </div>
+
+                      <div className="text-gray-400">{c.player.team}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
+        </div>
+
+        <div className="text-xs text-gray-500">
+          Backend expected at {API_BASE}.
         </div>
       </div>
     </main>
